@@ -244,11 +244,50 @@ impl Shared {
         }
     }
 
-    fn state(&self) -> State {
+    fn events(&self) -> Vec<Value> {
         let _guard = self.file.lock().unwrap();
         let text = fs::read_to_string(self.data.join(JOURNAL)).unwrap_or_default();
+        text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+    }
+
+    /// Finish what a crash cut short: a move that has an "intent" line but no "move" line.
+    fn recover(&self) {
+        let events = self.events();
+        let done: HashSet<&str> = events.iter().filter(|e| e["kind"] == "move" || e["kind"] == "abort").filter_map(|e| e["id"].as_str()).collect();
+        for e in events.iter().filter(|e| e["kind"] == "intent") {
+            let id = e["id"].as_str().unwrap_or_default();
+            if done.contains(id) {
+                continue;
+            }
+            let path = |key: &str| PathBuf::from(e[key].as_str().unwrap_or_default());
+            let (from, to) = (path("from"), path("to"));
+            let mut partial = to.as_os_str().to_owned();
+            partial.push(".partial");
+            let _ = fs::remove_file(partial);
+            let stash = self.data.join("replaced").join(id);
+            // The copy never landed. An old file that was already set aside goes back.
+            if !to.exists() {
+                if !stash.exists() || safe_move(&stash, &to).is_ok() {
+                    self.record(json!({"kind": "abort", "id": id}));
+                    self.log(format!("{}: interrupted move, nothing lost", to.display()));
+                }
+                continue;
+            }
+            // A finished copy has its final name (the rename is atomic), so `to` is ours.
+            let Ok(hash) = hash_file(&to) else { continue };
+            if from.exists() && (hash_file(&from).ok().as_ref() != Some(&hash) || fs::remove_file(&from).is_err()) {
+                self.log(format!("{}: interrupted move, left alone", from.display()));
+                continue;
+            }
+            let size = fs::metadata(&to).map(|m| m.len()).unwrap_or(0);
+            self.record(json!({"kind": "move", "id": id, "from": from, "to": to, "hash": hash, "size": size, "replaced": stash.exists()}));
+            self.log(format!("{}: interrupted move finished", to.display()));
+        }
+    }
+
+    fn state(&self) -> State {
         let mut state = State::default();
-        for event in text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
+        for event in self.events() {
             let text = |key: &str| event[key].as_str().unwrap_or_default().to_string();
             match event["kind"].as_str() {
                 Some("move") => state.moves.push(event),
@@ -458,14 +497,16 @@ fn file_one(sh: &Shared, path: &Path, dir: Option<PathBuf>, noted: &mut HashSet<
                 }
                 return Ok(None);
             }
-            Policy::Overwrite => {
-                let stash = sh.data.join("replaced");
-                fs::create_dir_all(&stash)?;
-                safe_move(&target, &stash.join(&id))?;
-                replaced = true;
-            }
+            Policy::Overwrite => replaced = true,
             Policy::Keep => target = free_name(&target),
         }
+    }
+    // Written first, so a crash between the copy and the "move" line can be finished at start.
+    sh.record(json!({"kind": "intent", "id": id, "from": path, "to": target}));
+    if replaced {
+        let stash = sh.data.join("replaced");
+        fs::create_dir_all(&stash)?;
+        safe_move(&target, &stash.join(&id))?;
     }
     let hash = safe_move(path, &target)?;
     sh.record(json!({
@@ -590,13 +631,14 @@ impl Shared {
         }
         fs::create_dir_all(dest.parent().unwrap_or(Path::new(""))).map_err(es)?;
         safe_move(&to, &dest).map_err(es)?;
-        let stash = self.data.join("replaced").join(id);
-        if stash.exists() {
-            safe_move(&stash, &to).map_err(es)?;
-        }
+        // Recorded before the rest: the file is back in the Inbox, so the scan must hold it.
         self.record(json!({"kind": "rollback", "id": id, "hash": hash, "size": m["size"], "restored": dest}));
         let line = format!("rolled back {}: restored {}", to.display(), dest.display());
         self.log(line.clone());
+        let stash = self.data.join("replaced").join(id);
+        if stash.exists() {
+            safe_move(&stash, &to).map_err(|e| format!("{line}, but the replaced file stays in {}: {e}", stash.display()))?;
+        }
         Ok(line)
     }
 
@@ -704,6 +746,7 @@ fn upload_loop(sh: Arc<Shared>) {
     let mut failed: HashMap<String, (u32, u64)> = HashMap::new();
     let mut retry_gen = 0;
     loop {
+        // One pause per batch, not per photo: a backlog goes out without waiting between files.
         thread::sleep(Duration::from_secs(5));
         if retry_gen != sh.retry_gen.load(Relaxed) {
             retry_gen = sh.retry_gen.load(Relaxed);
@@ -712,22 +755,28 @@ fn upload_loop(sh: Arc<Shared>) {
         if !sh.awake.load(Relaxed) || !sh.connected() {
             continue;
         }
-        let due = |m: &&Value| failed.get(m["id"].as_str().unwrap_or_default()).is_none_or(|(_, next)| *next <= unix_now());
-        let pending = sh.pending();
-        let Some(m) = pending.iter().find(due) else { continue };
-        let (id, to) = (m["id"].as_str().unwrap_or_default().to_string(), PathBuf::from(m["to"].as_str().unwrap_or_default()));
-        match sh.upload(&to) {
-            Ok(()) => {
-                sh.record(json!({"kind": "upload", "id": id, "hash": m["hash"], "to": to}));
-                sh.touch();
-                sh.log(format!("{}: uploaded to Google Photos", to.display()));
-                failed.remove(&id);
+        // The journal is read once per batch, not once per photo.
+        for m in sh.pending() {
+            if !sh.awake.load(Relaxed) || retry_gen != sh.retry_gen.load(Relaxed) {
+                break;
             }
-            Err(e) => {
-                let tries = failed.get(&id).map_or(1, |(n, _)| n + 1);
-                let wait = (60u64 << tries.min(6)).min(3600);
-                sh.log(format!("{}: upload failed ({e}), next try in {wait}s", to.display()));
-                failed.insert(id, (tries, unix_now() + wait));
+            let (id, to) = (m["id"].as_str().unwrap_or_default().to_string(), PathBuf::from(m["to"].as_str().unwrap_or_default()));
+            if failed.get(&id).is_some_and(|(_, next)| *next > unix_now()) {
+                continue;
+            }
+            match sh.upload(&to) {
+                Ok(()) => {
+                    sh.record(json!({"kind": "upload", "id": id, "hash": m["hash"], "to": to}));
+                    sh.touch();
+                    sh.log(format!("{}: uploaded to Google Photos", to.display()));
+                    failed.remove(&id);
+                }
+                Err(e) => {
+                    let tries = failed.get(&id).map_or(1, |(n, _)| n + 1);
+                    let wait = (60u64 << tries.min(6)).min(3600);
+                    sh.log(format!("{}: upload failed ({e}), next try in {wait}s", to.display()));
+                    failed.insert(id, (tries, unix_now() + wait));
+                }
             }
         }
     }
@@ -848,6 +897,7 @@ fn main() {
         var("OVERWRITE").as_deref().and_then(Policy::parse).unwrap_or(Policy::Skip),
         client,
     ));
+    sh.recover();
     // At least 1: a pause of 0 would scan without a break. A value set from the page wins.
     let saved = fs::read_to_string(data.join(INTERVAL_FILE)).ok().and_then(|s| s.trim().parse().ok());
     sh.interval.store(saved.unwrap_or(number("INTERVAL", 30)).max(1), Relaxed);
@@ -1091,6 +1141,50 @@ mod tests {
         assert_eq!(sh.policy(), Policy::Keep);
         get("/interval/0");
         assert_eq!(sh.interval.load(Relaxed), 7);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn finishes_a_move_cut_short_by_a_crash() {
+        let (sh, root) = setup("crash", Policy::Skip);
+        // Copy landed, original not yet deleted, no "move" line.
+        let from = put(&root, "a.jpg", "photo");
+        let to = root.join("library/2024/02/a.jpg");
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+        fs::write(&to, "photo").unwrap();
+        sh.record(json!({"kind": "intent", "id": "1", "from": from, "to": to}));
+        // Old file set aside, new one never placed.
+        let lost = root.join("library/2024/02/b.jpg");
+        fs::create_dir_all(sh.data.join("replaced")).unwrap();
+        fs::write(sh.data.join("replaced/2"), "old").unwrap();
+        sh.record(json!({"kind": "intent", "id": "2", "from": root.join("inbox/b.jpg"), "to": lost}));
+
+        sh.recover();
+        assert!(!from.exists());
+        assert_eq!(sh.state().moves.len(), 1);
+        assert_eq!(sh.pending().len(), 1, "the photo still goes to Google");
+        assert_eq!(fs::read_to_string(&lost).unwrap(), "old");
+        sh.recover();
+        assert_eq!(sh.state().moves.len(), 1, "a second start changes nothing");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn rollback_is_recorded_when_the_old_file_cannot_come_back() {
+        let (sh, root) = setup("half", Policy::Overwrite);
+        put(&root, "a.jpg", "old");
+        run(&sh, &mut HashSet::new());
+        put(&root, "a.jpg", "new");
+        run(&sh, &mut HashSet::new());
+        let id = sh.state().moves[1]["id"].as_str().unwrap().to_string();
+        // A folder in place of the stashed file makes the restore fail.
+        let stash = sh.data.join("replaced").join(&id);
+        fs::remove_file(&stash).unwrap();
+        fs::create_dir(&stash).unwrap();
+        assert!(sh.rollback(&id).unwrap_err().contains("replaced file stays"));
+        assert!(sh.state().rolled.contains(&id), "the scan holds the file");
+        run(&sh, &mut HashSet::new());
+        assert!(root.join("inbox/a.jpg").exists());
         fs::remove_dir_all(&root).unwrap();
     }
 }
