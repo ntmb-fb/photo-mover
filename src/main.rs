@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use std::{env, fs, io, thread};
@@ -25,6 +25,11 @@ const INTERVAL_FILE: &str = "interval";
 const REDIRECT: &str = "http://127.0.0.1";
 const SCOPE: &str = "https://www.googleapis.com/auth/photoslibrary.appendonly";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+/// Photos per upload round: Google takes up to 50 items per batchCreate call.
+const BATCH: usize = 50;
+/// Photos uploaded at the same time: start here, +1 after a clean round, halved when Google pushes back.
+const START_WORKERS: usize = 4;
+const MAX_WORKERS: usize = 8;
 const CHUNK: usize = 1024 * 1024;
 
 /// UTC "YYYY-MM-DD HH:MM:SS" for seconds since 1970 (days-to-date by Howard Hinnant).
@@ -701,10 +706,8 @@ impl Shared {
         Ok("Google connected.".into())
     }
 
-    /// Send one Library photo to Google Photos.
-    fn upload(&self, path: &Path) -> Result<(), String> {
-        let token = self.access_token()?;
-        let auth = format!("Bearer {token}");
+    /// Send one Library photo's bytes to Google Photos. Returns the upload token.
+    fn upload_bytes(&self, path: &Path, auth: &str) -> Result<String, String> {
         let mime = match ext(path).as_str() {
             "png" => "image/png",
             "heic" => "image/heic",
@@ -712,10 +715,9 @@ impl Shared {
         };
         // shortcut: the photo is read into memory, fine for photos, upgrade for videos.
         let bytes = fs::read(path).map_err(es)?;
-        let upload_token = self
-            .agent
+        self.agent
             .post("https://photoslibrary.googleapis.com/v1/uploads")
-            .header("Authorization", &auth)
+            .header("Authorization", auth)
             .header("Content-Type", "application/octet-stream")
             .header("X-Goog-Upload-Content-Type", mime)
             .header("X-Goog-Upload-Protocol", "raw")
@@ -723,35 +725,95 @@ impl Shared {
             .map_err(es)?
             .body_mut()
             .read_to_string()
-            .map_err(es)?;
-        let reply: Value = self
+            .map_err(es)
+    }
+
+    /// Add uploaded photos (file name, upload token) to the Google Photos library in one call.
+    /// One result per item, in order.
+    fn create_items(&self, items: &[(String, String)], auth: &str) -> Vec<Result<(), String>> {
+        let new_items: Vec<Value> = items
+            .iter()
+            .map(|(name, token)| json!({"simpleMediaItem": {"uploadToken": token, "fileName": name}}))
+            .collect();
+        let reply: Result<Value, String> = self
             .agent
             .post("https://photoslibrary.googleapis.com/v1/mediaItems:batchCreate")
-            .header("Authorization", &auth)
-            .send_json(json!({"newMediaItems": [{"simpleMediaItem": {
-                "uploadToken": upload_token,
-                "fileName": path.file_name().unwrap_or_default().to_string_lossy(),
-            }}]}))
-            .map_err(es)?
-            .body_mut()
-            .read_json()
-            .map_err(es)?;
-        let status = &reply["newMediaItemResults"][0]["status"];
-        match status["message"].as_str() {
-            Some("Success" | "OK") => Ok(()),
-            other => Err(format!("Google refused it: {}", other.unwrap_or("no status"))),
+            .header("Authorization", auth)
+            .send_json(json!({ "newMediaItems": new_items }))
+            .map_err(es)
+            .and_then(|mut r| r.body_mut().read_json().map_err(es));
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(e) => return items.iter().map(|_| Err(e.clone())).collect(),
+        };
+        (0..items.len())
+            .map(
+                |i| match reply["newMediaItemResults"][i]["status"]["message"].as_str() {
+                    Some("Success" | "OK") => Ok(()),
+                    other => Err(format!(
+                        "Google refused it: {}",
+                        other.unwrap_or("no status")
+                    )),
+                },
+            )
+            .collect()
+    }
+
+    /// Upload the photos on `workers` threads, then add them all in one call. One result per photo, in order.
+    fn upload_round(&self, due: &[Value], auth: &str, workers: usize) -> Vec<Result<(), String>> {
+        let next = AtomicUsize::new(0);
+        let tokens: Mutex<Vec<Option<Result<String, String>>>> = Mutex::new(vec![None; due.len()]);
+        thread::scope(|scope| {
+            for _ in 0..workers.min(due.len()) {
+                scope.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, Relaxed);
+                        let Some(m) = due.get(i) else { break };
+                        if !self.awake.load(Relaxed) {
+                            tokens.lock().unwrap()[i] = Some(Err("went to sleep".into()));
+                            continue;
+                        }
+                        let token = self
+                            .upload_bytes(Path::new(m["to"].as_str().unwrap_or_default()), auth);
+                        tokens.lock().unwrap()[i] = Some(token);
+                    }
+                });
+            }
+        });
+        let tokens: Vec<Result<String, String>> =
+            tokens.into_inner().unwrap().into_iter().flatten().collect();
+        let items: Vec<(String, String)> = due
+            .iter()
+            .zip(&tokens)
+            .filter_map(|(m, t)| {
+                let name = Path::new(m["to"].as_str().unwrap_or_default())
+                    .file_name()?
+                    .to_string_lossy()
+                    .into_owned();
+                Some((name, t.as_ref().ok()?.clone()))
+            })
+            .collect();
+        let mut created = if items.is_empty() {
+            Vec::new()
+        } else {
+            self.create_items(&items, auth)
         }
+        .into_iter();
+        tokens
+            .into_iter()
+            .map(|t| t.and_then(|_| created.next().unwrap_or(Err("no result".into()))))
+            .collect()
     }
 }
 
-/// Uploads Library photos one at a time, slowly backing off from failures.
+/// Uploads Library photos a few at a time, slowly backing off from failures.
 fn upload_loop(sh: Arc<Shared>) {
-    be_nice();
     // Move id -> (failures, next try in seconds since 1970).
     let mut failed: HashMap<String, (u32, u64)> = HashMap::new();
     let mut retry_gen = 0;
+    let mut workers = START_WORKERS;
     loop {
-        // One pause per batch, not per photo: a backlog goes out without waiting between files.
+        // One pause per round, not per photo: a backlog goes out without waiting between files.
         thread::sleep(Duration::from_secs(5));
         if retry_gen != sh.retry_gen.load(Relaxed) {
             retry_gen = sh.retry_gen.load(Relaxed);
@@ -760,16 +822,43 @@ fn upload_loop(sh: Arc<Shared>) {
         if !sh.awake.load(Relaxed) || !sh.connected() {
             continue;
         }
-        // The journal is read once per batch, not once per photo.
-        for m in sh.pending() {
-            if !sh.awake.load(Relaxed) || retry_gen != sh.retry_gen.load(Relaxed) {
-                break;
-            }
-            let (id, to) = (m["id"].as_str().unwrap_or_default().to_string(), PathBuf::from(m["to"].as_str().unwrap_or_default()));
-            if failed.get(&id).is_some_and(|(_, next)| *next > unix_now()) {
-                continue;
-            }
-            match sh.upload(&to) {
+        // The journal is read once per round, not once per photo.
+        let due: Vec<Value> = sh
+            .pending()
+            .into_iter()
+            .filter(|m| {
+                !failed
+                    .get(m["id"].as_str().unwrap_or_default())
+                    .is_some_and(|(_, next)| *next > unix_now())
+            })
+            .take(BATCH)
+            .collect();
+        if due.is_empty() {
+            continue;
+        }
+        let results = match sh.access_token() {
+            Ok(token) => sh.upload_round(&due, &format!("Bearer {token}"), workers),
+            Err(e) => due.iter().map(|_| Err(e.clone())).collect(),
+        };
+        // Too many requests or a Google error: halve. A clean round: one more.
+        let overloaded = results.iter().any(|r| r.as_ref().err().is_some_and(|e| e.contains("http status: 429") || e.contains("http status: 5")));
+        let next = if overloaded {
+            (workers / 2).max(1)
+        } else if results.iter().all(Result::is_ok) {
+            (workers + 1).min(MAX_WORKERS)
+        } else {
+            workers
+        };
+        if next != workers {
+            sh.log(format!("uploading {next} at a time ({})", if overloaded { "Google pushed back" } else { "all went well" }));
+            workers = next;
+        }
+        for (m, result) in due.iter().zip(results) {
+            let (id, to) = (
+                m["id"].as_str().unwrap_or_default().to_string(),
+                PathBuf::from(m["to"].as_str().unwrap_or_default()),
+            );
+            match result {
                 Ok(()) => {
                     sh.record(json!({"kind": "upload", "id": id, "hash": m["hash"], "to": to}));
                     sh.touch();
@@ -779,7 +868,10 @@ fn upload_loop(sh: Arc<Shared>) {
                 Err(e) => {
                     let tries = failed.get(&id).map_or(1, |(n, _)| n + 1);
                     let wait = (60u64 << tries.min(6)).min(3600);
-                    sh.log(format!("{}: upload failed ({e}), next try in {wait}s", to.display()));
+                    sh.log(format!(
+                        "{}: upload failed ({e}), next try in {wait}s",
+                        to.display()
+                    ));
                     failed.insert(id, (tries, unix_now() + wait));
                 }
             }
