@@ -1,0 +1,16 @@
+services:
+  photo-mover:
+    image: ghcr.io/ntmb-fb/photo-mover:latest
+    restart: unless-stopped
+    init: true
+    # uid:gid that owns the shares (the PUID/PGID of your other containers).
+    user: "1030:100"
+    environment:
+      GOOGLE_CLIENT_ID: ""
+      GOOGLE_CLIENT_SECRET: ""
+    ports:
+      - "8768:8768"
+    volumes:
+      - /volume1/photo/inbox:/inbox
+      - /volume1/photo/library:/library
+      - /volume1/docker/photo-mover:/data

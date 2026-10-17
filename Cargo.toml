@@ -1,0 +1,16 @@
+[package]
+name = "photo-mover"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+kamadak-exif = "0.6"
+serde_json = "1"
+sha2 = "0.10"
+ureq = { version = "3", features = ["json"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[profile.release]
+strip = true
