@@ -729,87 +729,123 @@ impl Shared {
     }
 
     /// Add uploaded photos (file name, upload token) to the Google Photos library in one call.
-    /// One result per item, in order.
-    fn create_items(&self, items: &[(String, String)], auth: &str) -> Vec<Result<(), String>> {
+    /// `Err`: the call failed as a whole. Otherwise one result per item, in order.
+    fn create_items(&self, items: &[(String, String)], auth: &str) -> Result<Vec<Result<(), String>>, String> {
         let new_items: Vec<Value> = items
             .iter()
             .map(|(name, token)| json!({"simpleMediaItem": {"uploadToken": token, "fileName": name}}))
             .collect();
-        let reply: Result<Value, String> = self
+        let reply: Value = self
             .agent
             .post("https://photoslibrary.googleapis.com/v1/mediaItems:batchCreate")
             .header("Authorization", auth)
             .send_json(json!({ "newMediaItems": new_items }))
-            .map_err(es)
-            .and_then(|mut r| r.body_mut().read_json().map_err(es));
-        let reply = match reply {
-            Ok(reply) => reply,
-            Err(e) => return items.iter().map(|_| Err(e.clone())).collect(),
-        };
-        (0..items.len())
-            .map(
-                |i| match reply["newMediaItemResults"][i]["status"]["message"].as_str() {
-                    Some("Success" | "OK") => Ok(()),
-                    other => Err(format!(
-                        "Google refused it: {}",
-                        other.unwrap_or("no status")
-                    )),
-                },
-            )
-            .collect()
+            .map_err(es)?
+            .body_mut()
+            .read_json()
+            .map_err(es)?;
+        Ok((0..items.len())
+            .map(|i| match reply["newMediaItemResults"][i]["status"]["message"].as_str() {
+                Some("Success" | "OK") => Ok(()),
+                other => Err(format!("Google refused it: {}", other.unwrap_or("no status"))),
+            })
+            .collect())
     }
 
-    /// Upload the photos on `workers` threads, then add them all in one call. One result per photo, in order.
-    fn upload_round(&self, due: &[Value], auth: &str, workers: usize) -> Vec<Result<(), String>> {
+    /// Upload the photos on `workers` threads, then add them all in one call. One outcome per photo, in order.
+    /// `known[i]` is an upload token from an earlier round: that photo's bytes are not sent again.
+    fn upload_round(&self, due: &[Value], known: &[Option<String>], auth: &str, workers: usize, generation: u64) -> Vec<Outcome> {
         let next = AtomicUsize::new(0);
-        let tokens: Mutex<Vec<Option<Result<String, String>>>> = Mutex::new(vec![None; due.len()]);
+        let sent: Mutex<Vec<Option<Upload>>> = Mutex::new(vec![None; due.len()]);
         thread::scope(|scope| {
             for _ in 0..workers.min(due.len()) {
                 scope.spawn(|| {
                     loop {
                         let i = next.fetch_add(1, Relaxed);
                         let Some(m) = due.get(i) else { break };
-                        if !self.awake.load(Relaxed) {
-                            tokens.lock().unwrap()[i] = Some(Err("went to sleep".into()));
-                            continue;
-                        }
-                        let token = self
-                            .upload_bytes(Path::new(m["to"].as_str().unwrap_or_default()), auth);
-                        tokens.lock().unwrap()[i] = Some(token);
+                        let up = if !self.awake.load(Relaxed) || self.retry_gen.load(Relaxed) != generation {
+                            Upload::Stopped
+                        } else if let Some(token) = &known[i] {
+                            Upload::Sent(token.clone())
+                        } else {
+                            match self.upload_bytes(Path::new(m["to"].as_str().unwrap_or_default()), auth) {
+                                Ok(token) => Upload::Sent(token),
+                                Err(e) => Upload::Failed(e),
+                            }
+                        };
+                        sent.lock().unwrap()[i] = Some(up);
                     }
                 });
             }
         });
-        let tokens: Vec<Result<String, String>> =
-            tokens.into_inner().unwrap().into_iter().flatten().collect();
+        let uploads: Vec<Upload> = sent.into_inner().unwrap().into_iter().flatten().collect();
         let items: Vec<(String, String)> = due
             .iter()
-            .zip(&tokens)
-            .filter_map(|(m, t)| {
-                let name = Path::new(m["to"].as_str().unwrap_or_default())
-                    .file_name()?
-                    .to_string_lossy()
-                    .into_owned();
-                Some((name, t.as_ref().ok()?.clone()))
+            .zip(&uploads)
+            .filter_map(|(m, u)| match u {
+                Upload::Sent(token) => {
+                    let name = Path::new(m["to"].as_str().unwrap_or_default()).file_name().unwrap_or_default();
+                    Some((name.to_string_lossy().into_owned(), token.clone()))
+                }
+                _ => None,
             })
             .collect();
-        let mut created = if items.is_empty() {
-            Vec::new()
-        } else {
-            self.create_items(&items, auth)
-        }
-        .into_iter();
-        tokens
-            .into_iter()
-            .map(|t| t.and_then(|_| created.next().unwrap_or(Err("no result".into()))))
-            .collect()
+        let created = if items.is_empty() { Ok(Vec::new()) } else { self.create_items(&items, auth) };
+        join(uploads, created)
     }
+}
+
+/// What happened to one photo's bytes.
+#[derive(Clone)]
+enum Upload {
+    /// Google has the bytes; this is the upload token.
+    Sent(String),
+    Failed(String),
+    /// Not tried: the service went to sleep or /upload/retry was called.
+    Stopped,
+}
+
+struct Outcome {
+    result: Result<(), String>,
+    /// Upload token to try again with, when only adding the photo failed.
+    token: Option<String>,
+    /// false: not tried, so no backoff.
+    tried: bool,
+}
+
+/// Match the upload step with the add step. `created` has one result per `Sent` photo, in order.
+fn join(uploads: Vec<Upload>, created: Result<Vec<Result<(), String>>, String>) -> Vec<Outcome> {
+    let mut created = created.map(Vec::into_iter);
+    let outcome = |result, token, tried| Outcome { result, token, tried };
+    uploads
+        .into_iter()
+        .map(|u| match u {
+            Upload::Stopped => outcome(Err("stopped".into()), None, false),
+            Upload::Failed(e) => outcome(Err(e), None, true),
+            Upload::Sent(token) => match &mut created {
+                Ok(results) => match results.next() {
+                    Some(result) => outcome(result, None, true),
+                    None => outcome(Err("no result".into()), Some(token), true),
+                },
+                Err(e) => outcome(Err(e.clone()), Some(token), true),
+            },
+        })
+        .collect()
+}
+
+/// Google asks to slow down, or has a problem of its own.
+fn overload(e: &str) -> bool {
+    e.contains("http status: 429") || e.contains("http status: 5")
 }
 
 /// Uploads Library photos a few at a time, slowly backing off from failures.
 fn upload_loop(sh: Arc<Shared>) {
     // Move id -> (failures, next try in seconds since 1970).
     let mut failed: HashMap<String, (u32, u64)> = HashMap::new();
+    // Move id -> (upload token, when). The bytes are with Google, only adding the photo failed, so a retry
+    // skips the upload. Unverified: if the lost add did succeed, Google may refuse the used token, and the
+    // retry then uploads the bytes again, which makes a duplicate. Google keeps tokens for a day.
+    let mut tokens: HashMap<String, (String, u64)> = HashMap::new();
     let mut retry_gen = 0;
     let mut workers = START_WORKERS;
     loop {
@@ -826,25 +862,26 @@ fn upload_loop(sh: Arc<Shared>) {
         let due: Vec<Value> = sh
             .pending()
             .into_iter()
-            .filter(|m| {
-                !failed
-                    .get(m["id"].as_str().unwrap_or_default())
-                    .is_some_and(|(_, next)| *next > unix_now())
-            })
+            .filter(|m| !failed.get(m["id"].as_str().unwrap_or_default()).is_some_and(|(_, next)| *next > unix_now()))
             .take(BATCH)
             .collect();
         if due.is_empty() {
             continue;
         }
-        let results = match sh.access_token() {
-            Ok(token) => sh.upload_round(&due, &format!("Bearer {token}"), workers),
-            Err(e) => due.iter().map(|_| Err(e.clone())).collect(),
+        let known: Vec<Option<String>> = due
+            .iter()
+            .map(|m| tokens.get(m["id"].as_str().unwrap_or_default()))
+            .map(|t| t.filter(|(_, when)| unix_now() < when + 20 * 3600).map(|(token, _)| token.clone()))
+            .collect();
+        let outcomes = match sh.access_token() {
+            Ok(token) => sh.upload_round(&due, &known, &format!("Bearer {token}"), workers, retry_gen),
+            Err(e) => due.iter().map(|_| Outcome { result: Err(e.clone()), token: None, tried: true }).collect(),
         };
-        // Too many requests or a Google error: halve. A clean round: one more.
-        let overloaded = results.iter().any(|r| r.as_ref().err().is_some_and(|e| e.contains("http status: 429") || e.contains("http status: 5")));
+        // Google pushes back: halve. A clean round: one more.
+        let overloaded = outcomes.iter().any(|o| o.result.as_ref().err().is_some_and(|e| overload(e)));
         let next = if overloaded {
             (workers / 2).max(1)
-        } else if results.iter().all(Result::is_ok) {
+        } else if outcomes.iter().all(|o| o.result.is_ok()) {
             (workers + 1).min(MAX_WORKERS)
         } else {
             workers
@@ -853,12 +890,16 @@ fn upload_loop(sh: Arc<Shared>) {
             sh.log(format!("uploading {next} at a time ({})", if overloaded { "Google pushed back" } else { "all went well" }));
             workers = next;
         }
-        for (m, result) in due.iter().zip(results) {
-            let (id, to) = (
-                m["id"].as_str().unwrap_or_default().to_string(),
-                PathBuf::from(m["to"].as_str().unwrap_or_default()),
-            );
-            match result {
+        for (m, o) in due.iter().zip(outcomes) {
+            if !o.tried {
+                continue;
+            }
+            let (id, to) = (m["id"].as_str().unwrap_or_default().to_string(), PathBuf::from(m["to"].as_str().unwrap_or_default()));
+            match o.token {
+                Some(token) => tokens.insert(id.clone(), (token, unix_now())),
+                None => tokens.remove(&id),
+            };
+            match o.result {
                 Ok(()) => {
                     sh.record(json!({"kind": "upload", "id": id, "hash": m["hash"], "to": to}));
                     sh.touch();
@@ -868,13 +909,14 @@ fn upload_loop(sh: Arc<Shared>) {
                 Err(e) => {
                     let tries = failed.get(&id).map_or(1, |(n, _)| n + 1);
                     let wait = (60u64 << tries.min(6)).min(3600);
-                    sh.log(format!(
-                        "{}: upload failed ({e}), next try in {wait}s",
-                        to.display()
-                    ));
+                    sh.log(format!("{}: upload failed ({e}), next try in {wait}s", to.display()));
                     failed.insert(id, (tries, unix_now() + wait));
                 }
             }
+        }
+        if overloaded {
+            sh.log("Google pushed back, pausing uploads for 60s".into());
+            thread::sleep(Duration::from_secs(60));
         }
     }
 }
@@ -1152,6 +1194,20 @@ mod tests {
         assert!(!clip.exists());
         assert_eq!((found("videos"), found("library")), (1, 0));
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn join_matches_each_photo_with_its_own_result() {
+        let uploads = || vec![Upload::Sent("a".into()), Upload::Failed("x".into()), Upload::Sent("b".into()), Upload::Stopped, Upload::Sent("c".into())];
+        let out = join(uploads(), Ok(vec![Ok(()), Err("refused".into()), Ok(())]));
+        assert!(out[0].result.is_ok() && out[4].result.is_ok());
+        assert_eq!(out[1].result, Err("x".to_string()));
+        assert_eq!((out[2].result.clone(), out[2].token.clone()), (Err("refused".to_string()), None));
+        assert!(!out[3].tried);
+        // The add call failed as a whole: the photos that were sent keep their token.
+        let out = join(uploads(), Err("timeout".into()));
+        let kept: Vec<_> = out.iter().map(|o| o.token.clone()).collect();
+        assert_eq!(kept, [Some("a".to_string()), None, Some("b".to_string()), None, Some("c".to_string())]);
     }
 
     #[test]
