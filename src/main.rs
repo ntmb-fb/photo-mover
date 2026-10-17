@@ -151,6 +151,8 @@ impl Policy {
 struct Shared {
     inbox: PathBuf,
     library: PathBuf,
+    /// Where videos go; the same as `library` unless VIDEO_LIBRARY is set.
+    video_library: PathBuf,
     data: PathBuf,
     default_policy: Policy,
     policy: AtomicU8,
@@ -185,6 +187,7 @@ impl Shared {
     fn new(
         inbox: PathBuf,
         library: PathBuf,
+        video_library: PathBuf,
         data: PathBuf,
         default_policy: Policy,
         client: Option<(String, String)>,
@@ -192,6 +195,7 @@ impl Shared {
         Shared {
             inbox,
             library,
+            video_library,
             data,
             default_policy,
             policy: AtomicU8::new(default_policy as u8),
@@ -476,7 +480,8 @@ fn file_one(sh: &Shared, path: &Path, dir: Option<PathBuf>, noted: &mut HashSet<
         Some(dir) => dir,
         None => {
             let (year, month) = capture_month(path, meta.modified()?);
-            sh.library.join(year).join(month)
+            let root = if VIDEO.contains(&ext(path).as_str()) { &sh.video_library } else { &sh.library };
+            root.join(year).join(month)
         }
     };
     fs::create_dir_all(&dir)?;
@@ -890,9 +895,11 @@ fn main() {
         std::process::exit(1);
     }
     let client = var("GOOGLE_CLIENT_ID").zip(var("GOOGLE_CLIENT_SECRET"));
+    let library = PathBuf::from(var("LIBRARY").unwrap_or("/library".into()));
     let sh = Arc::new(Shared::new(
         var("INBOX").unwrap_or("/inbox".into()).into(),
-        var("LIBRARY").unwrap_or("/library".into()).into(),
+        library.clone(),
+        var("VIDEO_LIBRARY").map_or(library, PathBuf::from),
         data.clone(),
         var("OVERWRITE").as_deref().and_then(Policy::parse).unwrap_or(Policy::Skip),
         client,
@@ -904,9 +911,10 @@ fn main() {
     let (log_days, port) = (number("LOG_DAYS", 60), number("PORT", 8768) as u16);
     let idle_minutes = number("IDLE_MINUTES", 60);
     sh.log(format!(
-        "watching {} -> {} every {}s, name clashes: {}, Google Photos {}",
+        "watching {} -> {} (videos: {}) every {}s, name clashes: {}, Google Photos {}",
         sh.inbox.display(),
         sh.library.display(),
+        sh.video_library.display(),
         sh.interval.load(Relaxed),
         sh.default_policy.name(),
         if sh.client.is_some() { "on" } else { "off" },
@@ -996,10 +1004,10 @@ mod tests {
     fn setup(name: &str, policy: Policy) -> (Shared, PathBuf) {
         let root = env::temp_dir().join(format!("photo-mover-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        for d in ["inbox", "library", "data"] {
+        for d in ["inbox", "library", "videos", "data"] {
             fs::create_dir_all(root.join(d)).unwrap();
         }
-        let sh = Shared::new(root.join("inbox"), root.join("library"), root.join("data"), policy, None);
+        let sh = Shared::new(root.join("inbox"), root.join("library"), root.join("videos"), root.join("data"), policy, None);
         (sh, root)
     }
 
@@ -1036,6 +1044,21 @@ mod tests {
         assert!(!root.join("inbox/trip/IMG_1.jpg").exists());
         assert_eq!(sh.state().moves.len(), 2);
         assert_eq!(sh.pending().len(), 1, "only the photo goes to Google");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn videos_go_to_their_own_library() {
+        let (sh, root) = setup("video", Policy::Skip);
+        let clip = put(&root, "a.mp4", "clip");
+        run(&sh, &mut HashSet::new());
+        let found = |lib: &str| {
+            let mut files = Vec::new();
+            walk(&root.join(lib), &mut files).unwrap();
+            files.len()
+        };
+        assert!(!clip.exists());
+        assert_eq!((found("videos"), found("library")), (1, 0));
         fs::remove_dir_all(&root).unwrap();
     }
 

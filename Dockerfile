@@ -10,6 +10,7 @@ COPY --from=build /app/target/release/photo-mover /photo-mover
 # Listed so container UIs show the settings with their defaults.
 ENV INBOX=/inbox \
     LIBRARY=/library \
+    VIDEO_LIBRARY= \
     INTERVAL=30 \
     IDLE_MINUTES=60 \
     OVERWRITE=skip \

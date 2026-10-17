@@ -6,6 +6,7 @@ services:
     # uid:gid that owns the shares (the PUID/PGID of your other containers).
     user: "1030:100"
     environment:
+      VIDEO_LIBRARY: /videos
       GOOGLE_CLIENT_ID: ""
       GOOGLE_CLIENT_SECRET: ""
     ports:
@@ -13,4 +14,5 @@ services:
     volumes:
       - /volume1/photo/inbox:/inbox
       - /volume1/photo/library:/library
+      - /volume1/photo/videos:/videos
       - /volume1/docker/photo-mover:/data

@@ -16,6 +16,7 @@ Watches an inbox folder and moves each photo into a library by capture date, the
 |---|---|---|
 | `INBOX` | `/inbox` | Folder to watch (subfolders too) |
 | `LIBRARY` | `/library` | Photo library |
+| `VIDEO_LIBRARY` | same as `LIBRARY` | Where videos go, same `YYYY/MM` layout |
 | `INTERVAL` | `30` | Seconds between scans. A value set with `/interval/<s>` wins after that |
 | `IDLE_MINUTES` | `60` | Fall asleep after this long with nothing new. `0`: never |
 | `OVERWRITE` | `skip` | Clash setting at each wake: `skip`, `overwrite`, `keep` |
