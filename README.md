@@ -31,6 +31,8 @@ Watches an inbox folder and moves each photo into a library by capture date, the
 
 ## Google Photos
 
-1. Cloud console: enable the Photos Library API, create an OAuth client of type **Desktop app**, and set the consent screen to **In production** (in Testing, refresh tokens expire after 7 days).
-2. Put the ID and secret in `compose.yaml`.
-3. Open the page, click *Approve access*, accept the "not verified" warning. The next page will not load: paste its address into the box. This is done once.
+1. Cloud console: enable the Photos Library API, then create an OAuth client of type **Desktop app**.
+2. Consent screen, **Testing** mode (works when *Publish app* is unavailable): under *Audience*, add your Google account as a **Test user**. In Testing, Google expires the refresh token after 7 days, so repeat step 4 about once a week. **In production** has no expiry.
+3. Put the client ID and secret in `compose.yaml` and restart.
+4. Open the page and click *Approve access*. Choose your account and accept the "Google hasn't verified this app" warning (*Advanced*, then *Go to … (unsafe)*). Tick the Photos permission.
+5. The browser then lands on a page that fails to load (`http://127.0.0.1/?state=…&code=…&scope=…`). That is expected. Copy the **whole address from the address bar** and paste it into the box on the photo-mover page, then click *Connect*. The address holds a one-time code; nothing else is needed.

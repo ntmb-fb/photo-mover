@@ -960,7 +960,7 @@ fn page(sh: &Shared, note: &str) -> String {
     let recent = esc(&lines[lines.len().saturating_sub(20)..].join("\n"));
     let policy = |p: Policy| if sh.policy() == p { format!("<b>{}</b>", p.name()) } else { format!("<a href=/overwrite/{0}>{0}</a>", p.name()) };
     format!(
-        "<!doctype html><meta name=viewport content='width=device-width'><title>photo-mover</title><h1>photo-mover</h1>\
+        "<!doctype html><meta name=viewport content='width=device-width'><title>photo-mover</title><h1>photo-mover <small>v{ver}</small></h1>\
          <p>{note}</p><p>{state} Scans every {}s (<a href=/interval/5>5</a> | <a href=/interval/30>30</a> | <a href=/interval/300>300</a>). \
          Name clash with other content: {} | {} | {}.</p>\
          <p><a href=/start>Start</a> | <a href=/stop>Stop</a> | <a href=/release>Release held files</a> | <a href=/>Refresh</a></p>\
@@ -969,6 +969,7 @@ fn page(sh: &Shared, note: &str) -> String {
         policy(Policy::Skip),
         policy(Policy::Overwrite),
         policy(Policy::Keep),
+        ver = env!("CARGO_PKG_VERSION"),
         note = esc(note),
     )
 }
