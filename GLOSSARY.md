@@ -9,8 +9,12 @@ The watched folder photos arrive in. Replaces the idea of a user-picked Source.
 _Avoid_: Source, input, watch folder
 
 **Library**:
-The organized photo tree on the NAS, laid out as `YYYY/MM/<filename>` by capture date.
+The organized photo tree on the NAS, laid out as `YYYY/MM/<filename>` by capture date. Videos go to the optional **Video library**, with the same layout; it defaults to the Library itself.
 _Avoid_: Archive, destination
+
+**Video library**:
+Where videos are filed when `VIDEO_LIBRARY` is set. Same `YYYY/MM/<filename>` layout as the Library; never uploaded.
+_Avoid_: Second library, movie folder
 
 **Session**:
 The awake period between a wake call and the next Sleep. Carries its own Overwrite policy.
