@@ -1,0 +1,68 @@
+name: Delete merged branches
+
+# Deletes a pull request's branch once the PR is merged, and sweeps old
+# merged branches every Monday or by hand (Actions > Delete merged
+# branches > Run workflow).
+#
+# A branch is deleted only when ALL of these hold:
+# - a merged PR has exactly the branch's current commit as its head
+#   (so nothing was pushed to it after the merge)
+# - no open PR uses the branch
+# - it is not the default branch and not protected
+# Tags are never touched. GitHub can restore a deleted PR branch from the
+# PR page ("Restore branch").
+
+on:
+  pull_request:
+    types: [closed]
+  schedule:
+    - cron: "37 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: delete-merged-branches
+  cancel-in-progress: false
+
+jobs:
+  delete:
+    if: github.event_name != 'pull_request' || (github.event.pull_request.merged && github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const { data: info } = await github.rest.repos.get({ owner, repo });
+            const prs = await github.paginate(github.rest.pulls.list, { owner, repo, state: "all", per_page: 100 });
+            const own = (p) => p.head.repo && p.head.repo.full_name === `${owner}/${repo}`;
+            const openRefs = new Set(prs.filter((p) => p.state === "open" && own(p)).map((p) => p.head.ref));
+            const mergedShas = new Set(prs.filter((p) => p.merged_at && own(p)).map((p) => p.head.sha));
+
+            let branches;
+            if (context.eventName === "pull_request") {
+              const ref = context.payload.pull_request.head.ref;
+              try {
+                const { data } = await github.rest.repos.getBranch({ owner, repo, branch: ref });
+                branches = [data];
+              } catch (e) { if (e.status === 404) return; throw e; }
+            } else {
+              branches = await github.paginate(github.rest.repos.listBranches, { owner, repo, per_page: 100 });
+            }
+
+            const deleted = [];
+            for (const b of branches) {
+              if (b.name === info.default_branch || b.protected) continue;
+              if (openRefs.has(b.name) || !mergedShas.has(b.commit.sha)) continue;
+              try {
+                await github.rest.git.deleteRef({ owner, repo, ref: `heads/${b.name}` });
+                deleted.push(b.name);
+                core.info(`deleted ${b.name}`);
+              } catch (e) { if (e.status !== 404 && e.status !== 422) throw e; }
+            }
+            const summary = `Deleted ${deleted.length} merged branches${deleted.length ? ":\n" + deleted.join("\n") : "."}`;
+            core.info(summary);
+            await core.summary.addHeading("Delete merged branches").addCodeBlock(summary).write();
