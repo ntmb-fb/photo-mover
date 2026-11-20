@@ -1,0 +1,56 @@
+name: Purge green run logs
+
+# When a workflow run finishes green, delete its logs. Failed and
+# cancelled runs keep their logs so they can be debugged. Artifacts and
+# caches are not touched.
+#
+# Note: logs do not count toward the Actions storage limit (artifacts and
+# caches do), so this only tidies the run history.
+#
+# Run it by hand (Actions > Purge green run logs > Run workflow) to purge
+# the logs of all earlier green runs once.
+#
+# When you add or rename a workflow, add its name to the list below.
+
+on:
+  workflow_run:
+    workflows: ["build"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  purge:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            // Treat "already gone" (404) as done.
+            const del = async (run_id) => {
+              try { await github.rest.actions.deleteWorkflowRunLogs({ owner, repo, run_id }); return true; }
+              catch (e) { if (e.status === 404) return false; throw e; }
+            };
+
+            if (context.eventName === "workflow_run") {
+              const run = context.payload.workflow_run;
+              await del(run.id);
+              core.info(`deleted logs of ${run.name} run ${run.id} (${run.head_branch})`);
+              return;
+            }
+
+            // By hand: purge logs of every earlier green run.
+            const runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
+              owner, repo, status: "success", per_page: 100,
+            });
+            let n = 0;
+            for (const r of runs) {
+              if (r.id === context.runId) continue;
+              if (await del(r.id)) n++;
+            }
+            core.info(`deleted logs of ${n} green runs`);
+            await core.summary.addHeading("Purge green run logs").addRaw(`Deleted logs of ${n} green runs.`).write();
