@@ -3,6 +3,9 @@ name: build
 on:
   push:
     branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
@@ -11,6 +14,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       # Docker Hub is used only once these secrets exist.
       HUB_NAME: ${{ secrets.DOCKERHUB_NAME }}
@@ -18,14 +22,31 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
       - uses: docker/setup-buildx-action@v4
+      - id: meta
+        run: |
+          repo=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
+          sha="sha-${GITHUB_SHA::7}"
+          tags="ghcr.io/${repo}:latest"$'\n'"ghcr.io/${repo}:${sha}"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tags+=$'\n'"ghcr.io/${repo}:${GITHUB_REF_NAME}"
+          fi
+          if [[ -n "${HUB_NAME}" && -n "${HUB_TOKEN}" ]]; then
+            tags+=$'\n'"${HUB_NAME}/photo-mover:latest"$'\n'"${HUB_NAME}/photo-mover:${sha}"
+            if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+              tags+=$'\n'"${HUB_NAME}/photo-mover:${GITHUB_REF_NAME}"
+            fi
+          fi
+          { echo "tags<<EOF"; echo "${tags}"; echo "EOF"; } >> "${GITHUB_OUTPUT}"
       - uses: docker/login-action@v4
+        if: github.event_name != 'pull_request'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/login-action@v4
-        if: env.HUB_NAME != '' && env.HUB_TOKEN != ''
+        if: github.event_name != 'pull_request' && env.HUB_NAME != '' && env.HUB_TOKEN != ''
         with:
           username: ${{ env.HUB_NAME }}
           password: ${{ env.HUB_TOKEN }}
@@ -33,7 +54,5 @@ jobs:
         with:
           context: .
           platforms: linux/amd64
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:latest
-            ${{ env.HUB_NAME != '' && env.HUB_TOKEN != '' && format('{0}/photo-mover:latest', env.HUB_NAME) || '' }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}

@@ -31,6 +31,7 @@ jobs:
   delete:
     if: github.event_name != 'pull_request' || (github.event.pull_request.merged && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/github-script@v8
         with:
@@ -40,7 +41,7 @@ jobs:
             const prs = await github.paginate(github.rest.pulls.list, { owner, repo, state: "all", per_page: 100 });
             const own = (p) => p.head.repo && p.head.repo.full_name === `${owner}/${repo}`;
             const openRefs = new Set(prs.filter((p) => p.state === "open" && own(p)).map((p) => p.head.ref));
-            const mergedShas = new Set(prs.filter((p) => p.merged_at && own(p)).map((p) => p.head.sha));
+            const mergedHeads = new Set(prs.filter((p) => p.merged_at && own(p)).map((p) => `${p.head.ref}\0${p.head.sha}`));
 
             let branches;
             if (context.eventName === "pull_request") {
@@ -56,7 +57,7 @@ jobs:
             const deleted = [];
             for (const b of branches) {
               if (b.name === info.default_branch || b.protected) continue;
-              if (openRefs.has(b.name) || !mergedShas.has(b.commit.sha)) continue;
+              if (openRefs.has(b.name) || !mergedHeads.has(`${b.name}\0${b.commit.sha}`)) continue;
               try {
                 await github.rest.git.deleteRef({ owner, repo, ref: `heads/${b.name}` });
                 deleted.push(b.name);

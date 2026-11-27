@@ -1,5 +1,6 @@
 FROM rust:1-alpine AS build
 RUN apk add --no-cache musl-dev
+ENV RUSTFLAGS="-C target-feature=+crt-static"
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src src

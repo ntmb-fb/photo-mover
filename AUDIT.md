@@ -178,3 +178,26 @@ However, the audit identified several **data-safety, operational, security, and 
 2. **Fix user-facing operational bugs:** H3 (Google reconnect + OAuth error display), H5 (wake-up `/overwrite/<policy>` reset), M2 (token expiry/401/TTL handling), H7 (`delete-merged-branches.yml` ref+SHA check).
 3. **Harden HTTP & lifecycle:** H4 (`POST` + CSRF/PRG + 404 on unknown paths), M4 (header parsing & concurrency), M5 (`0600` on `google.json`), M7 (`SIGTERM` handling).
 4. **Polish performance, CI, and tests:** M3 (sidecars), M6 (`walk` resilience), M8 (in-memory state cache), L4 (PR CI + SHA-pinned actions + immutable image tags), L5 (expanded tests).
+
+---
+
+## Resolution Status (`v0.2.0`)
+
+| ID | Status | Summary of Fix |
+|---|---|---|
+| **H1** | Fixed | `file_one()` restores any stashed `replaced/<id>` file and records `"abort"` on runtime errors; logs actual copied byte count. |
+| **H2** | Fixed | `prune_empty()` uses `symlink_metadata()` and skips `.`/`@`/`#` system directories. |
+| **H3** | Fixed | Added `POST /google/disconnect` and *Disconnect / reconnect* UI button, plus OAuth error body surfacing on the page. |
+| **H4** | Fixed | State-changing routes now require `POST`, enforce `Sec-Fetch-Site` + `Origin`/`Host` checks, return `303 See Other` PRG redirects, and return `404`/`405` without waking on unknown/GET calls. |
+| **H5** | Fixed | `Shared::wake()` resets policy and updates `sleep_at` before `/overwrite/<policy>` is applied; `main()` no longer clobbers `policy` on wake. |
+| **H6** | Fixed | `prune()` preserves unreleased rollback holds, upload records for surviving moves, and `replaced/<id>` files by surviving IDs; `LOG_FILE` is protected by `log_file` mutex. |
+| **H7** | Fixed | `delete-merged-branches.yml` now matches `(head.ref, head.sha)` pairs instead of commit SHA alone. |
+| **M1** | Fixed | `copy_hashed()`/`safe_move()` preserves `mtime`, cleans up `.partial` on error, and `fsync`s destination parent directory before deleting source. |
+| **M2** | Fixed | 5-min token refresh headroom, per-worker/pre-batch token fetch, cache invalidation on 401, no token wipe on auth errors, original upload-token TTL preserved, typed status + `Retry-After` + gRPC `batchCreate` status/overload handling. |
+| **M3** | Fixed | Supports `<stem>.<ext>.xmp`, prioritizes photos/RAW over videos for Live Photo sidecars, and seeds `homes` from recent moves for late-arriving sidecars. |
+| **M4** | Fixed | Proper `\r\n\r\n` header parsing + `Content-Length` body reading; bounded concurrent HTTP handler threads (`MAX_HTTP_CLIENTS`). |
+| **M5** | Fixed | `google.json` written atomically with `0o600` permissions on Unix. |
+| **M6** | Fixed | `walk()` skips unreadable sub-entries instead of aborting the whole Inbox scan. |
+| **M7** | Fixed | Installed Linux `SIGTERM`/`SIGINT` handlers to exit scan/upload loops cleanly and join the uploader thread. |
+| **M8** | Deferred | In-memory `State` cache left for a future change to keep journal persistence minimal. |
+| **L1–L5** | Mostly fixed | Monotonic move IDs, responsive interval loop, upload activity touch, stale map eviction, `PORT` validation, `esc()` quoting, `#fragment` stripping, `crt-static` in `Dockerfile`, hardened `compose.yaml`, PR CI + clippy + immutable Docker tags + job timeouts, updated `README.md`, and 6 new regression tests (16 total). Remaining optional follow-ups: pinning GitHub Actions to commit SHAs, real EXIF test fixture, and optional `TZ`/streaming uploads. |

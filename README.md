@@ -8,7 +8,7 @@ Watches an inbox folder and moves each photo into a library by capture date, the
 - Same name, same content: the inbox copy is removed. Same name, other content follows the clash setting: `skip` (leave it, default), `overwrite` (old file is kept for rollback), `keep` (`name-1.jpg`).
 - Only `jpg jpeg png heic` go to Google Photos, from the library copy after the move. An upload never deletes anything. Uploads run in parallel batches of up to 50 photos: 4 at a time at first, one more after a clean round (up to 8), half as many when Google answers 429 or 5xx.
 - Every move, upload and rollback is a line in `transactions.jsonl`. `/rollback/<id>` puts the file back in the inbox and restores a replaced file. A rolled-back file is ignored by the watcher until `/release`. Google Photos keeps the photo.
-- The service sleeps after `IDLE_MINUTES` without activity. Any call except `/` and `/favicon.ico` wakes it.
+- The service sleeps after `IDLE_MINUTES` without activity. Any `POST` action wakes it.
 
 ## Settings
 
@@ -27,12 +27,12 @@ Watches an inbox folder and moves each photo into a library by capture date, the
 
 ## Calls
 
-`/start`, `/stop`, `/interval/30`, `/overwrite/keep`, `/rollback/<id>`, `/release`, `/upload/retry`. The page has no password: do not expose it to the internet.
+`POST` to `/start`, `/stop`, `/interval/30`, `/overwrite/keep`, `/rollback/<id>`, `/release`, `/upload/retry`, `/google/disconnect`. The page has no password: do not expose it to the internet.
 
 ## Google Photos
 
 1. Cloud console: enable the Photos Library API, then create an OAuth client of type **Desktop app**.
-2. Consent screen, **Testing** mode (works when *Publish app* is unavailable): under *Audience*, add your Google account as a **Test user**. In Testing, Google expires the refresh token after 7 days, so repeat step 4 about once a week. **In production** has no expiry.
+2. Consent screen, **Testing** mode (works when *Publish app* is unavailable): under *Audience*, add your Google account as a **Test user**. In Testing, Google expires the refresh token after 7 days, so click *Disconnect / reconnect* and repeat step 4 about once a week. **In production** has no expiry.
 3. Put the client ID and secret in `compose.yaml` and restart.
 4. Open the page and click *Approve access*. Choose your account and accept the "Google hasn't verified this app" warning (*Advanced*, then *Go to … (unsafe)*). Tick the Photos permission.
-5. The browser then lands on a page that fails to load (`http://127.0.0.1/?state=…&code=…&scope=…`). That is expected. Copy the **whole address from the address bar** and paste it into the box on the photo-mover page, then click *Connect*. The address holds a one-time code; nothing else is needed.
+5. The browser then lands on a page that fails to load (`http://127.0.0.1/?code=…&scope=…`). That is expected. Copy the **whole address from the address bar** and paste it into the box on the photo-mover page, then click *Connect*. The address holds a one-time code; nothing else is needed.

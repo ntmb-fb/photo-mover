@@ -3,6 +3,11 @@ services:
     image: ghcr.io/ntmb-fb/photo-mover:latest
     restart: unless-stopped
     init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     # uid:gid that owns the shares (the PUID/PGID of your other containers).
     user: "1030:100"
     environment:
